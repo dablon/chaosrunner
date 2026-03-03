@@ -1,54 +1,54 @@
 $VERSION = "1.0.0"
 $BINARY_NAME = "chaosrunner"
-$REPO_URL = "https://github.com/dablon/chaosrunner"
 
-Write-Host "Installing $BINARY_NAME v$VERSION..." -ForegroundColor Cyan
-
-# Detect OS
-$OS = $PSVersionTable.OS
-if ($OS -match "Linux") { $OS_NAME = "linux" }
-elseif ($OS -match "Darwin") { $OS_NAME = "darwin" }
-else { $OS_NAME = "windows" }
-
-# Detect Architecture
-$ARCH = $env:PROCESSOR_ARCHITECTURE
-if ($ARCH -eq "AMD64") { $ARCH_NAME = "amd64" }
-elseif ($ARCH -eq "ARM64") { $ARCH_NAME = "arm64" }
-else { $ARCH_NAME = $ARCH }
-
-# Download URL
-$DOWNLOAD_URL = "$REPO_URL/releases/latest/download/$BINARY_NAME-$OS_NAME-$ARCH_NAME"
-
-# For Windows, add .exe
-if ($OS_NAME -eq "windows") {
-    $BINARY_NAME = "$BINARY_NAME.exe"
-    $DOWNLOAD_URL = "$DOWNLOAD_URL.exe"
-}
-
-# Install directory
 $INSTALL_DIR = "$env:LOCALAPPDATA\Programs\$BINARY_NAME"
+$BINARY_NAME_FINAL = "$BINARY_NAME.exe"
+
 if (-not (Test-Path $INSTALL_DIR)) {
     New-Item -ItemType Directory -Path $INSTALL_DIR -Force | Out-Null
 }
 
-# Download
-Write-Host "Downloading from $DOWNLOAD_URL..." -ForegroundColor Yellow
-Invoke-WebRequest -Uri $DOWNLOAD_URL -OutFile "$INSTALL_DIR\$BINARY_NAME" -UseBasicParsing
-
-# Make executable (Linux/Mac)
-if ($OS_NAME -ne "windows") {
-    chmod +x "$INSTALL_DIR/$BINARY_NAME"
+$SCRIPT_DIR = $PSScriptRoot
+if (-not $SCRIPT_DIR) {
+    $SCRIPT_DIR = Get-Location
 }
 
-# Add to PATH
+$machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+$env:Path = "$machinePath;$userPath"
+
+Write-Host "Installing $BINARY_NAME v$VERSION from local source..." -ForegroundColor Cyan
+Write-Host "Building with Go..." -ForegroundColor Yellow
+
+Set-Location $SCRIPT_DIR
+go build -buildvcs=false -o "$INSTALL_DIR\$BINARY_NAME_FINAL" ./cmd
+
+if (-not (Test-Path "$INSTALL_DIR\$BINARY_NAME_FINAL")) {
+    Write-Host "ERROR: Build failed" -ForegroundColor Red
+    exit 1
+}
+
+Write-Host "Built successfully!" -ForegroundColor Green
+
 $PATH_ENTRY = $INSTALL_DIR
-$currentPath = [Environment]::GetEnvironmentVariable("Path", "User")
-if ($currentPath -notlike "*$PATH_ENTRY*") {
-    [Environment]::SetEnvironmentVariable("Path", "$currentPath;$PATH_ENTRY", "User")
+if ($userPath -notlike "*$PATH_ENTRY*") {
+    [Environment]::SetEnvironmentVariable("Path", "$userPath;$PATH_ENTRY", "User")
+    $userPath = "$userPath;$PATH_ENTRY"
     Write-Host "Added to PATH: $PATH_ENTRY" -ForegroundColor Green
-    Write-Host "Please restart your terminal or run: " -ForegroundColor Yellow
-    Write-Host "  `$env:Path = [System.Environment]::GetEnvironmentVariable('Path','User')" -ForegroundColor Cyan
+    
+    if (-not ("Win32.NativeMethods" -as [type])) {
+        Add-Type -Namespace Win32 -Name NativeMethods -MemberDefinition @"
+            [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+            public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, UIntPtr wParam, string lParam, uint fuFlags, uint uTimeout, out UIntPtr lpdwResult);
+"@
+        $HWND_BROADCAST = [IntPtr]0xffff
+        $WM_SETTINGCHANGE = 0x1a
+        $result = [UIntPtr]::Zero
+        [Win32.NativeMethods]::SendMessageTimeout($HWND_BROADCAST, $WM_SETTINGCHANGE, [UIntPtr]::Zero, "Environment", 2, 5000, [ref]$result) | Out-Null
+    }
+    
+    $env:Path = "$machinePath;$userPath"
 }
 
-Write-Host "Installed to $INSTALL_DIR\$BINARY_NAME" -ForegroundColor Green
-Write-Host "Done! Run: $BINARY_NAME --help" -ForegroundColor Cyan
+Write-Host "Installed to $INSTALL_DIR\$BINARY_NAME_FINAL" -ForegroundColor Green
+Write-Host "Done! Run: $BINARY_NAME_FINAL --help" -ForegroundColor Cyan
