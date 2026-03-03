@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"regexp"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -11,6 +12,21 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 )
+
+var validK8sNameRegex = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
+
+func ValidateK8sName(name string) error {
+	if name == "" {
+		return fmt.Errorf("name cannot be empty")
+	}
+	if len(name) > 253 {
+		return fmt.Errorf("name cannot exceed 253 characters")
+	}
+	if !validK8sNameRegex.MatchString(name) {
+		return fmt.Errorf("name must consist of lower case alphanumeric characters or '-', and must start and end with an alphanumeric character")
+	}
+	return nil
+}
 
 type K8sClient struct {
 	Clientset *kubernetes.Clientset
@@ -38,9 +54,10 @@ func (c *K8sClient) Init() error {
 	return nil
 }
 
-func (c *K8sClient) GetRunningPod(namespace string) (*K8sPod, error) {
-	ctx := context.Background()
-	pods, err := c.Clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
+func (c *K8sClient) GetRunningPod(ctx context.Context, namespace, labelSelector string) (*K8sPod, error) {
+	pods, err := c.Clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: labelSelector,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -52,6 +69,7 @@ func (c *K8sClient) GetRunningPod(namespace string) (*K8sPod, error) {
 				Name:      pod.Name,
 				Namespace: pod.Namespace,
 				Phase:     string(pod.Status.Phase),
+				Ready:     isPodReady(&pod),
 			}
 			k8sPod.CaptureResources(&pod)
 			return k8sPod, nil
@@ -60,9 +78,10 @@ func (c *K8sClient) GetRunningPod(namespace string) (*K8sPod, error) {
 	return nil, fmt.Errorf("no running pods found in namespace %s", namespace)
 }
 
-func (c *K8sClient) GetPods(namespace string) ([]K8sPod, error) {
-	ctx := context.Background()
-	pods, err := c.Clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
+func (c *K8sClient) GetPods(ctx context.Context, namespace, labelSelector string) ([]K8sPod, error) {
+	pods, err := c.Clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: labelSelector,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -74,6 +93,7 @@ func (c *K8sClient) GetPods(namespace string) ([]K8sPod, error) {
 			Name:      pod.Name,
 			Namespace: pod.Namespace,
 			Phase:     string(pod.Status.Phase),
+			Ready:     isPodReady(pod),
 		}
 		k8sPod.CaptureResources(pod)
 		result = append(result, k8sPod)
@@ -81,16 +101,20 @@ func (c *K8sClient) GetPods(namespace string) ([]K8sPod, error) {
 	return result, nil
 }
 
-func (c *K8sClient) DeletePod(namespace, name string) error {
-	ctx := context.Background()
+func (c *K8sClient) DeletePod(ctx context.Context, namespace, name string) error {
 	return c.Clientset.CoreV1().Pods(namespace).Delete(ctx, name, metav1.DeleteOptions{})
 }
 
-func (c *K8sClient) WaitForPodReady(namespace, podName string, timeout time.Duration) error {
-	ctx := context.Background()
+func (c *K8sClient) WaitForPodReady(ctx context.Context, namespace, podName string, timeout time.Duration) error {
 	start := time.Now()
 
 	for time.Since(start) < timeout {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
 		pod, err := c.Clientset.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
 		if err != nil {
 			time.Sleep(500 * time.Millisecond)
@@ -106,8 +130,37 @@ func (c *K8sClient) WaitForPodReady(namespace, podName string, timeout time.Dura
 	return fmt.Errorf("timeout waiting for pod %s to be ready", podName)
 }
 
-func (c *K8sClient) GetPodStats(namespace, podName string) (*PodStats, error) {
-	ctx := context.Background()
+func (c *K8sClient) WaitForNewPodReady(ctx context.Context, namespace, labelSelector, excludePodName string, timeout time.Duration) error {
+	start := time.Now()
+
+	for time.Since(start) < timeout {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		pods, err := c.Clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+			LabelSelector: labelSelector,
+		})
+		if err != nil {
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+
+		for i := range pods.Items {
+			pod := &pods.Items[i]
+			if pod.Name != excludePodName && pod.Status.Phase == "Running" && isPodReady(pod) {
+				return nil
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	return fmt.Errorf("timeout waiting for new pod to be ready in namespace %s", namespace)
+}
+
+func (c *K8sClient) GetPodStats(ctx context.Context, namespace, podName string) (*PodStats, error) {
 	pod, err := c.Clientset.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
 	if err != nil {
 		return nil, err
@@ -118,22 +171,19 @@ func (c *K8sClient) GetPodStats(namespace, podName string) (*PodStats, error) {
 		Namespace: pod.Namespace,
 		Phase:     string(pod.Status.Phase),
 		Age:       time.Since(pod.CreationTimestamp.Time).Round(time.Second),
+		Ready:     isPodReady(pod),
 	}
 
+	var totalRestarts int32
 	for _, cs := range pod.Status.ContainerStatuses {
 		if cs.State.Running != nil {
-			stats.Ready = true
-			stats.Restarts = cs.RestartCount
 			stats.StartedAt = cs.State.Running.StartedAt.Time
 		}
+		totalRestarts += cs.RestartCount
 	}
 
-	if len(pod.Status.ContainerStatuses) > 0 {
-		stats.TotalContainers = len(pod.Status.ContainerStatuses)
-		for _, cs := range pod.Status.ContainerStatuses {
-			stats.Restarts += cs.RestartCount
-		}
-	}
+	stats.Restarts = totalRestarts
+	stats.TotalContainers = len(pod.Status.ContainerStatuses)
 
 	return stats, nil
 }
@@ -155,7 +205,7 @@ type K8sPod struct {
 	MemoryRequest string
 	CPULimit      string
 	MemoryLimit   string
-	Ready         string
+	Ready         bool
 	Restarts      int32
 	Age           time.Duration
 }
@@ -180,15 +230,12 @@ func (p *K8sPod) CaptureResources(pod *corev1.Pod) {
 		}
 	}
 
+	p.Ready = isPodReady(pod)
+	var totalRestarts int32
 	for _, c := range pod.Status.ContainerStatuses {
-		if c.Ready {
-			p.Ready = "1/1"
-		}
-		p.Restarts = c.RestartCount
+		totalRestarts += c.RestartCount
 	}
-	if p.Ready == "" {
-		p.Ready = "0/1"
-	}
+	p.Restarts = totalRestarts
 }
 
 type PodStats struct {

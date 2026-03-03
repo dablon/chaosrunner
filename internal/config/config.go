@@ -1,9 +1,30 @@
 package config
 
-import "os"
-type Config struct{Port int; LogLevel string}
-func Default()*Config{return &Config{Port:8080,LogLevel:"info"}}
-func(c*Config)LoadFromEnv(){
-    if v:=os.Getenv("PORT");v!=""{c.Port=6000}
-    if v:=os.Getenv("LOG_LEVEL");v!=""{c.LogLevel=v}
+import (
+	"fmt"
+	"os"
+	"strconv"
+)
+
+type Config struct {
+	Port     int
+	LogLevel string
+}
+
+func Default() *Config {
+	return &Config{Port: 8080, LogLevel: "info"}
+}
+
+func (c *Config) LoadFromEnv() error {
+	if v := os.Getenv("PORT"); v != "" {
+		port, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("invalid PORT value '%s': %v", v, err)
+		}
+		c.Port = port
+	}
+	if v := os.Getenv("LOG_LEVEL"); v != "" {
+		c.LogLevel = v
+	}
+	return nil
 }

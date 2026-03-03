@@ -2,7 +2,6 @@ package handler
 
 import (
 	"fmt"
-	"os"
 
 	"github.com/dablon/chaosrunner/internal/client"
 	"github.com/dablon/chaosrunner/internal/experiments"
@@ -49,46 +48,10 @@ func (h *Handler) GetExperiment(name string) (experiments.Experiment, error) {
 	}
 }
 
-func (h *Handler) PodKill(namespace, duration string) error {
-	exp, err := h.GetExperiment("pod-kill")
+func (h *Handler) RunExperiment(name, namespace, duration string, opts *experiments.ExperimentOptions) error {
+	exp, err := h.GetExperiment(name)
 	if err != nil {
 		return err
 	}
-	return exp.Run(namespace, duration)
-}
-
-func (h *Handler) NetworkLatency(namespace, duration string) error {
-	exp, err := h.GetExperiment("network-latency")
-	if err != nil {
-		return err
-	}
-	return exp.Run(namespace, duration)
-}
-
-func (h *Handler) CpuStress(namespace, duration string) error {
-	exp, err := h.GetExperiment("cpu-stress")
-	if err != nil {
-		return err
-	}
-	return exp.Run(namespace, duration)
-}
-
-func (h *Handler) MemoryHog(namespace, duration string) error {
-	exp, err := h.GetExperiment("memory-hog")
-	if err != nil {
-		return err
-	}
-	return exp.Run(namespace, duration)
-}
-
-func (h *Handler) DiskFill(namespace, duration string) error {
-	exp, err := h.GetExperiment("disk-fill")
-	if err != nil {
-		return err
-	}
-	return exp.Run(namespace, duration)
-}
-
-func init() {
-	os.Setenv("KUBECONFIG", "")
+	return exp.Run(namespace, duration, opts)
 }

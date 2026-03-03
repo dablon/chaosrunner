@@ -26,7 +26,7 @@ func getCPUMetric(podName, namespace string) string {
 	}
 	fields := strings.Fields(strings.TrimSpace(string(out)))
 	if len(fields) >= 2 {
-		return fields[1] // CPU column
+		return fields[1]
 	}
 	return strings.TrimSpace(string(out))
 }
@@ -35,70 +35,86 @@ func (e *CpuStressExperiment) Name() string {
 	return "cpu-stress"
 }
 
-func (e *CpuStressExperiment) Run(namespace, duration string) error {
-	e.PrintHeader("cpu-stress")
-	fmt.Printf("   Namespace: %s\n", namespace)
-	fmt.Printf("   Duration: %s\n", duration)
-	fmt.Printf("   Stress workers: 4\n")
+func (e *CpuStressExperiment) Run(namespace, duration string, opts *ExperimentOptions) error {
+	workers := opts.Workers
+	if workers <= 0 {
+		workers = 4
+	}
+
+	if IsTextOutput(opts) {
+		e.PrintHeader("cpu-stress", opts)
+		fmt.Printf("   Namespace: %s\n", namespace)
+		fmt.Printf("   Duration: %s\n", duration)
+		fmt.Printf("   Stress workers: %d\n", workers)
+	}
+
+	result := &ExperimentResult{
+		Experiment: "cpu-stress",
+		Namespace:  namespace,
+		Duration:   duration,
+		Success:    true,
+		Metrics:    make(map[string]interface{}),
+	}
 
 	dur, err := ParseDuration(duration)
 	if err != nil {
+		result.Error = err.Error()
+		result.Success = false
 		return err
 	}
 
-	targetPod, err := e.k8sClient.GetRunningPod(namespace)
+	targetPod, err := e.k8sClient.GetRunningPod(opts.Ctx, namespace, opts.Selector)
 	if err != nil {
+		result.Error = err.Error()
+		result.Success = false
 		return err
 	}
 
-	fmt.Printf("\n🔍 DIAGNOSIS - Initial State:\n")
+	if IsTextOutput(opts) {
+		fmt.Printf("\n🔍 DIAGNOSIS - Initial State:\n")
 
-	statsBefore, err := e.k8sClient.GetPodStats(namespace, targetPod.Name)
-	if err == nil {
-		fmt.Printf("   ✓ Target pod: %s\n", targetPod.Name)
-		fmt.Printf("      Status: %s\n", statsBefore.Phase)
-		fmt.Printf("      Restarts: %d\n", statsBefore.Restarts)
-		fmt.Printf("      Age: %s\n", statsBefore.Age)
+		statsBefore, err := e.k8sClient.GetPodStats(opts.Ctx, namespace, targetPod.Name)
+		if err == nil {
+			fmt.Printf("   ✓ Target pod: %s\n", targetPod.Name)
+			fmt.Printf("      Status: %s\n", statsBefore.Phase)
+			fmt.Printf("      Restarts: %d\n", statsBefore.Restarts)
+			fmt.Printf("      Age: %s\n", statsBefore.Age)
+		}
+
+		podsBefore, _ := e.k8sClient.GetPods(opts.Ctx, namespace, opts.Selector)
+		fmt.Printf("   ✓ Namespace overview: %d pods running\n", len(podsBefore))
+
+		fmt.Printf("\n⚙️  EXECUTION - Starting CPU Stress:\n")
+
+		baselineCPU := getCPUMetric(targetPod.Name, namespace)
+		fmt.Printf("   📊 CPU before stress: %s\n", baselineCPU)
+
+		stressDuration := int(dur.Seconds())
+		fmt.Printf("   🚀 Starting stress-ng (%d workers, %ds)...\n\n", workers, stressDuration)
 	}
-
-	podsBefore, _ := e.k8sClient.GetPods(namespace)
-	fmt.Printf("   ✓ Namespace overview: %d pods running\n", len(podsBefore))
-
-	fmt.Printf("\n⚙️  EXECUTION - Starting CPU Stress:\n")
-
-	baselineCPU := getCPUMetric(targetPod.Name, namespace)
-	fmt.Printf("   📊 CPU before stress: %s\n", baselineCPU)
 
 	stressDuration := int(dur.Seconds())
 
-	fmt.Printf("   🚀 Starting stress-ng (4 workers, %ds)...\n\n", stressDuration)
-
-	// Install + run stress with fallbacks for Debian, Alpine, and RHEL-based images
-	stressScript := func(secs int) string {
-		return fmt.Sprintf(strings.Join([]string{
-			"stress-ng --cpu 4 --timeout %[1]ds 2>/dev/null",
-			"|| stress -c 4 -t %[1]ds 2>/dev/null",
-			"|| (apt-get update -qq && apt-get install -y -qq stress-ng && stress-ng --cpu 4 --timeout %[1]ds) 2>/dev/null",
-			"|| (apk add --no-cache stress-ng && stress-ng --cpu 4 --timeout %[1]ds) 2>/dev/null",
-			"|| (yum install -y -q stress-ng && stress-ng --cpu 4 --timeout %[1]ds) 2>/dev/null",
-			// Last resort: pure shell CPU burn
-			"|| (for i in 1 2 3 4; do while :; do :; done & done; sleep %[1]d; kill 0)",
-		}, " "), secs)
+	stressScript := func(secs int, wkrs int) string {
+		workers := fmt.Sprintf("%d", wkrs)
+		return fmt.Sprintf("stress-ng --cpu %s --timeout %ds 2>/dev/null || stress -c %s -t %ds 2>/dev/null || (apt-get update -qq && apt-get install -y -qq stress-ng && stress-ng --cpu %s --timeout %ds) 2>/dev/null || (apk add --no-cache stress-ng && stress-ng --cpu %s --timeout %ds) 2>/dev/null || (yum install -y -q stress-ng && stress-ng --cpu %s --timeout %ds) 2>/dev/null || (for i in $(seq 1 %s); do while :; do :; done & done; sleep %d; kill 0)",
+			workers, secs, workers, secs, workers, secs, workers, secs, workers, secs, workers, secs)
 	}
 
 	startStress := func(secs int) *exec.Cmd {
-		return exec.Command("kubectl", "exec", "-n", namespace, targetPod.Name, "--", "sh", "-c", stressScript(secs))
+		return exec.Command("kubectl", "exec", "-n", namespace, targetPod.Name, "--", "sh", "-c", stressScript(secs, workers))
 	}
 
-	// Run stress in background so we can monitor in real-time
 	stressCmd := startStress(stressDuration)
 	stressDone := make(chan error, 1)
 	if err := stressCmd.Start(); err != nil {
-		return fmt.Errorf("failed to start stress: %w", err)
+		errMsg := fmt.Sprintf("failed to start stress: %v", err)
+		result.Error = errMsg
+		result.Success = false
+		return fmt.Errorf("%s", errMsg)
 	}
 	go func() { stressDone <- stressCmd.Wait() }()
 
-	// Real-time progress monitoring
 	startTime := time.Now()
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
@@ -118,14 +134,25 @@ func (e *CpuStressExperiment) Run(namespace, duration string) error {
 			cpu)
 	}
 
-	// Initial progress line
-	printProgress(0, baselineCPU)
+	if IsTextOutput(opts) {
+		printProgress(0, getCPUMetric(targetPod.Name, namespace))
+	}
 
 	stressRunning := true
 	retries := 0
 	maxRetries := 2
+
 	for time.Since(startTime) < dur {
 		select {
+		case <-opts.Ctx.Done():
+			if stressRunning {
+				_ = stressCmd.Process.Kill()
+			}
+			if IsTextOutput(opts) {
+				fmt.Printf("\n⚠ Experiment cancelled\n")
+			}
+			result.Metrics["cancelled"] = true
+			break
 		case <-stressDone:
 			if stressRunning {
 				stressRunning = false
@@ -133,7 +160,9 @@ func (e *CpuStressExperiment) Run(namespace, duration string) error {
 				remaining := dur - elapsed
 				if remaining > 5*time.Second && retries < maxRetries {
 					retries++
-					fmt.Printf("\n   ⚠ Stress exited early, restarting (%d/%d) for %s...\n", retries, maxRetries, remaining.Round(time.Second))
+					if IsTextOutput(opts) {
+						fmt.Printf("\n   ⚠ Stress exited early, restarting (%d/%d) for %s...\n", retries, maxRetries, remaining.Round(time.Second))
+					}
 					stressCmd = startStress(int(remaining.Seconds()))
 					stressDone = make(chan error, 1)
 					if err := stressCmd.Start(); err == nil {
@@ -141,7 +170,9 @@ func (e *CpuStressExperiment) Run(namespace, duration string) error {
 						go func() { stressDone <- stressCmd.Wait() }()
 					}
 				} else if retries >= maxRetries {
-					fmt.Printf("\n   ⚠ Stress tool unavailable in container. Monitoring pod for remaining %s...\n", remaining.Round(time.Second))
+					if IsTextOutput(opts) {
+						fmt.Printf("\n   ⚠ Stress tool unavailable in container. Monitoring pod for remaining %s...\n", remaining.Round(time.Second))
+					}
 				}
 			}
 		case <-ticker.C:
@@ -149,52 +180,61 @@ func (e *CpuStressExperiment) Run(namespace, duration string) error {
 			if elapsed >= dur {
 				break
 			}
-			cpuNow := getCPUMetric(targetPod.Name, namespace)
-			printProgress(elapsed, cpuNow)
+			if IsTextOutput(opts) {
+				cpuNow := getCPUMetric(targetPod.Name, namespace)
+				printProgress(elapsed, cpuNow)
+			}
 		}
 	}
 
-	// Final progress update
-	cpuFinal := getCPUMetric(targetPod.Name, namespace)
-	printProgress(dur, cpuFinal)
-	fmt.Println()
+	if IsTextOutput(opts) {
+		cpuFinal := getCPUMetric(targetPod.Name, namespace)
+		printProgress(dur, cpuFinal)
+		fmt.Println()
 
-	// Kill stress if still running past duration
-	if stressRunning {
-		_ = stressCmd.Process.Kill()
-	}
-
-	fmt.Printf("\n   ✅ CPU stress completed\n")
-
-	time.Sleep(2 * time.Second)
-
-	fmt.Printf("\n📈 RESULTS - After Stress:\n")
-
-	statsAfter, err := e.k8sClient.GetPodStats(namespace, targetPod.Name)
-	if err == nil {
-		fmt.Printf("   ✓ Target pod: %s\n", targetPod.Name)
-		fmt.Printf("      Status: %s\n", statsAfter.Phase)
-		fmt.Printf("      Restarts: %d (before: %d)\n", statsAfter.Restarts, statsBefore.Restarts)
-		if statsAfter.Restarts > statsBefore.Restarts {
-			fmt.Printf("      ⚠ Pod was restarted during stress!\n")
+		if stressRunning {
+			_ = stressCmd.Process.Kill()
 		}
-	}
 
-	cpuAfter := getCPUMetric(targetPod.Name, namespace)
-	fmt.Printf("   📊 CPU after stress: %s\n", cpuAfter)
+		fmt.Printf("\n   ✅ CPU stress completed\n")
 
-	podsAfter, _ := e.k8sClient.GetPods(namespace)
-	running := 0
-	for _, p := range podsAfter {
-		if p.Phase == "Running" {
-			running++
+		time.Sleep(2 * time.Second)
+
+		fmt.Printf("\n📈 RESULTS - After Stress:\n")
+
+		statsAfter, err := e.k8sClient.GetPodStats(opts.Ctx, namespace, targetPod.Name)
+		if err == nil {
+			fmt.Printf("   ✓ Target pod: %s\n", targetPod.Name)
+			fmt.Printf("      Status: %s\n", statsAfter.Phase)
+			fmt.Printf("      Restarts: %d (before: %d)\n", statsAfter.Restarts, 0)
+			if statsAfter.Restarts > 0 {
+				fmt.Printf("      ⚠ Pod was restarted during stress!\n")
+			}
 		}
-	}
-	fmt.Printf("   ✓ Final state: %d/%d pods running\n", running, len(podsAfter))
-	fmt.Printf("   ✓ Duration: %s\n", duration)
 
-	e.PrintFooter(duration)
-	fmt.Printf("   CPU stress test completed\n")
+		cpuAfter := getCPUMetric(targetPod.Name, namespace)
+		fmt.Printf("   📊 CPU after stress: %s\n", cpuAfter)
+
+		result.Metrics["cpu_before"] = getCPUMetric(targetPod.Name, namespace)
+		result.Metrics["cpu_after"] = cpuAfter
+
+		podsAfter, _ := e.k8sClient.GetPods(opts.Ctx, namespace, opts.Selector)
+		running := 0
+		for _, p := range podsAfter {
+			if p.Phase == "Running" {
+				running++
+			}
+		}
+		fmt.Printf("   ✓ Final state: %d/%d pods running\n", running, len(podsAfter))
+		fmt.Printf("   ✓ Duration: %s\n", duration)
+
+		e.PrintFooter(duration, opts)
+		fmt.Printf("   CPU stress test completed\n")
+	}
+
+	if opts.Output == "json" {
+		result.PrintJSON()
+	}
 
 	return nil
 }
