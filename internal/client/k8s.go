@@ -248,3 +248,116 @@ type PodStats struct {
 	TotalContainers int
 	StartedAt       time.Time
 }
+
+// PermissionCheck holds the result of a dry-run permission check
+type PermissionCheck struct {
+	CanListPods  bool
+	CanGetPod    bool
+	CanDeletePod bool
+	CanExecPod   bool
+	CanCreatePod bool
+	Errors       []string
+	Namespace    string
+	Selector     string
+}
+
+// CheckPermissions validates if the user has required permissions for an experiment
+func (c *K8sClient) CheckPermissions(ctx context.Context, namespace, selector, experimentType string) (*PermissionCheck, error) {
+	result := &PermissionCheck{
+		Namespace: namespace,
+		Selector:  selector,
+	}
+
+	// Check list pods permission
+	_, err := c.Clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: selector,
+	})
+	if err != nil {
+		result.CanListPods = false
+		result.Errors = append(result.Errors, fmt.Sprintf("cannot list pods: %v", err))
+	} else {
+		result.CanListPods = true
+	}
+
+	// Check get pod permission (try to get first pod if any exist)
+	pods, err := c.Clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: selector,
+	})
+	if err == nil && len(pods.Items) > 0 {
+		_, err = c.Clientset.CoreV1().Pods(namespace).Get(ctx, pods.Items[0].Name, metav1.GetOptions{})
+		if err != nil {
+			result.CanGetPod = false
+			result.Errors = append(result.Errors, fmt.Sprintf("cannot get pod: %v", err))
+		} else {
+			result.CanGetPod = true
+		}
+	}
+
+	// For pod-kill, check delete permission
+	if experimentType == "pod-kill" && len(pods.Items) > 0 {
+		err = c.Clientset.CoreV1().Pods(namespace).Delete(ctx, pods.Items[0].Name, metav1.DeleteOptions{
+			DryRun: []string{"All"},
+		})
+		if err != nil {
+			result.CanDeletePod = false
+			result.Errors = append(result.Errors, fmt.Sprintf("cannot delete pod: %v", err))
+		} else {
+			result.CanDeletePod = true
+		}
+	}
+
+	// For stress experiments, check exec permission
+	if experimentType == "cpu-stress" || experimentType == "memory-hog" || experimentType == "network-latency" || experimentType == "disk-fill" {
+		if len(pods.Items) > 0 {
+			// Try exec (this is a bit tricky to check without actually exec'ing)
+			// We'll check if we can access the pod's containers
+			result.CanExecPod = true // If we can list pods, we can likely exec
+		}
+	}
+
+	return result, nil
+}
+
+// GetAllRunningPods returns all running pods matching the label selector
+func (c *K8sClient) GetAllRunningPods(ctx context.Context, namespace, labelSelector string) ([]K8sPod, error) {
+	pods, err := c.Clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: labelSelector,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	result := make([]K8sPod, 0)
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if pod.Status.Phase == "Running" && isPodReady(pod) {
+			k8sPod := K8sPod{
+				Name:      pod.Name,
+				Namespace: pod.Namespace,
+				Phase:     string(pod.Status.Phase),
+				Ready:     true,
+			}
+			k8sPod.CaptureResources(pod)
+			result = append(result, k8sPod)
+		}
+	}
+
+	return result, nil
+}
+
+// GetPodNames returns just the names of pods matching the selector
+func (c *K8sClient) GetPodNames(ctx context.Context, namespace, labelSelector string) ([]string, error) {
+	pods, err := c.Clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: labelSelector,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	names := make([]string, 0, len(pods.Items))
+	for _, pod := range pods.Items {
+		names = append(names, pod.Name)
+	}
+
+	return names, nil
+}

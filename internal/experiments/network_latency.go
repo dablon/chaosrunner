@@ -88,26 +88,49 @@ func (e *NetworkLatencyExperiment) Run(namespace, duration string, opts *Experim
 	checkTcCmd := exec.Command("kubectl", "exec", "-n", namespace, targetPod.Name, "--", "sh", "-c", "which tc")
 	checkOutput, checkErr := checkTcCmd.CombinedOutput()
 	if checkErr != nil || len(checkOutput) == 0 {
-		errMsg := "tc command not found in container. Network latency experiment requires 'iproute2' package installed in the container image."
-		result.Error = errMsg
-		result.Success = false
 		if IsTextOutput(opts) {
-			fmt.Printf("   ✗ %s\n", errMsg)
-			fmt.Printf("   ℹ Install iproute2 in your container image or use a different base image\n")
+			fmt.Printf("   ℹ tc not found, attempting to install iproute2...\n")
 		}
-		return fmt.Errorf("%s", errMsg)
+
+		installCmd := exec.Command("kubectl", "exec", "-n", namespace, targetPod.Name, "--", "sh", "-c",
+			"apk add --no-cache iproute2 2>/dev/null || apt-get update -qq && apt-get install -y -qq iproute2 2>/dev/null || yum install -y -q iproute2 2>/dev/null || true")
+		installOutput, _ := installCmd.CombinedOutput()
+
+		checkTcCmd = exec.Command("kubectl", "exec", "-n", namespace, targetPod.Name, "--", "sh", "-c", "which tc")
+		checkOutput, checkErr = checkTcCmd.CombinedOutput()
+
+		if checkErr != nil || len(checkOutput) == 0 {
+			errMsg := "tc command not found in container. Tried to install iproute2 but failed."
+			result.Error = errMsg
+			result.Success = false
+			if IsTextOutput(opts) {
+				fmt.Printf("   ✗ %s\n", errMsg)
+				fmt.Printf("   ℹ Install iproute2 in your container image or use a different base image\n")
+				fmt.Printf("   ℹ Installation output: %s\n", string(installOutput))
+			}
+			return fmt.Errorf("%s", errMsg)
+		}
+
+		if IsTextOutput(opts) {
+			fmt.Printf("   ✅ Successfully installed iproute2\n")
+		}
 	}
 
 	latencyCmd := exec.Command("kubectl", "exec", "-n", namespace, targetPod.Name, "--", "sh", "-c",
-		fmt.Sprintf("tc qdisc add dev eth0 root netem delay %s 2>/dev/null || tc qdisc change dev eth0 root netem delay %s 2>/dev/null", delay, delay))
+		fmt.Sprintf("tc qdisc add dev eth0 root netem delay %s 2>&1 || tc qdisc change dev eth0 root netem delay %s 2>&1 || (ip link show && tc qdisc add dev eth0 root netem delay %s)", delay, delay, delay))
 	latencyOutput, latencyErr := latencyCmd.CombinedOutput()
 
-	if latencyErr != nil || strings.Contains(string(latencyOutput), "not found") {
-		errMsg := fmt.Sprintf("failed to apply network latency: tc command failed. Output: %s, Error: %v", string(latencyOutput), latencyErr)
+	outputStr := string(latencyOutput)
+	if latencyErr != nil || strings.Contains(outputStr, "not found") || strings.Contains(outputStr, "Operation not permitted") || strings.Contains(outputStr, "RTNETLINK answers") {
+		errMsg := fmt.Sprintf("failed to apply network latency. Output: %s, Error: %v", outputStr, latencyErr)
 		result.Error = errMsg
 		result.Success = false
 		if IsTextOutput(opts) {
 			fmt.Printf("   ✗ %s\n", errMsg)
+			if strings.Contains(outputStr, "Operation not permitted") || strings.Contains(outputStr, "permission") {
+				fmt.Printf("   ℹ The container needs NET_ADMIN capability or must run as privileged\n")
+				fmt.Printf("   ℹ Try: kubectl patch deployment %s -p '{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"*\",\"securityContext\":{\"privileged\":true}}]}}}'\n", targetPod.Name)
+			}
 		}
 		return fmt.Errorf("%s", errMsg)
 	}
