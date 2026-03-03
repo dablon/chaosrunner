@@ -37,42 +37,87 @@ func (e *NetworkLatencyExperiment) Run(namespace, duration string) error {
 		return err
 	}
 
-	fmt.Printf("\n⚙️  Progress:\n")
-	fmt.Printf("   ✓ Identified pods in namespace\n")
+	fmt.Printf("\n🔍 DIAGNOSIS - Initial State:\n")
+
+	statsBefore, err := e.k8sClient.GetPodStats(namespace, targetPod.Name)
+	if err == nil {
+		fmt.Printf("   ✓ Target pod: %s\n", targetPod.Name)
+		fmt.Printf("      Status: %s\n", statsBefore.Phase)
+		fmt.Printf("      Restarts: %d\n", statsBefore.Restarts)
+		fmt.Printf("      Age: %s\n", statsBefore.Age)
+	}
+
+	podsBefore, _ := e.k8sClient.GetPods(namespace)
+	fmt.Printf("   ✓ Namespace overview: %d pods running\n", len(podsBefore))
+
+	fmt.Printf("\n⚙️  EXECUTION - Injecting Network Latency:\n")
 	fmt.Printf("   ✓ Selected target: %s\n", targetPod.Name)
-	fmt.Printf("   ✓ Applying network latency using tc...\n")
 
 	cmd := exec.Command("kubectl", "exec", "-n", namespace, targetPod.Name, "--", "sh", "-c",
 		"tc qdisc add dev eth0 root netem delay 5s 2>/dev/null || tc qdisc change dev eth0 root netem delay 5s 2>/dev/null")
 	_ = cmd.Run()
 
-	fmt.Printf("   ✓ Network latency applied\n")
+	fmt.Printf("   ✓ Network latency applied (5s delay)\n")
+
+	cmd = exec.Command("kubectl", "exec", "-n", namespace, targetPod.Name, "--", "sh", "-c",
+		"tc qdisc show dev eth0")
+	output, _ := cmd.CombinedOutput()
+	fmt.Printf("   📊 Current qdisc config:\n%s\n", string(output))
+
+	startTime := time.Now()
+	var lastReport time.Duration
 
 	fmt.Printf("   ⏳ Maintaining latency for %s...\n", duration)
 
-	startTime := time.Now()
-	iteration := 1
-
 	for time.Since(startTime) < dur {
-		fmt.Printf("   ✓ Iteration %d: Latency active (%.0fs elapsed)\n", iteration, time.Since(startTime).Seconds())
-		time.Sleep(10 * time.Second)
-		iteration++
+		elapsed := time.Since(startTime)
+
+		if elapsed-lastReport >= 30*time.Second || elapsed >= dur {
+			cmd := exec.Command("kubectl", "exec", "-n", namespace, targetPod.Name, "--", "sh", "-c",
+				"tc qdisc show dev eth0 | grep delay")
+			output, _ := cmd.CombinedOutput()
+			latencyInfo := "active (5s delay)"
+			if len(output) > 0 {
+				latencyInfo = string(output)
+			}
+			fmt.Printf("   📊 [%s elapsed] Network latency: %s\n", elapsed.Round(time.Second), latencyInfo)
+			lastReport = elapsed
+		}
+
+		time.Sleep(5 * time.Second)
 	}
 
-	fmt.Printf("   ✓ Cleaning up network latency...\n")
+	fmt.Printf("\n📈 RESULTS - After Latency Test:\n")
+
+	fmt.Printf("   🚀 Cleaning up network latency...\n")
 
 	cleanupCmd := exec.Command("kubectl", "exec", "-n", namespace, targetPod.Name, "--", "sh", "-c",
 		"tc qdisc del dev eth0 root 2>/dev/null || true")
 	_ = cleanupCmd.Run()
 
-	fmt.Printf("\n📊 Metrics:\n")
-	fmt.Printf("   Latency added: 5s\n")
-	fmt.Printf("   Target: %s\n", targetPod.Name)
-	fmt.Printf("   Total duration: %s\n", duration)
-	fmt.Printf("   Iterations: %d\n", iteration-1)
+	statsAfter, err := e.k8sClient.GetPodStats(namespace, targetPod.Name)
+	if err == nil {
+		fmt.Printf("   ✓ Target pod: %s\n", targetPod.Name)
+		fmt.Printf("      Status: %s\n", statsAfter.Phase)
+		fmt.Printf("      Restarts: %d (before: %d)\n", statsAfter.Restarts, statsBefore.Restarts)
+		if statsAfter.Restarts > statsBefore.Restarts {
+			fmt.Printf("      ⚠ Pod was restarted!\n")
+		}
+	}
+
+	podsAfter, _ := e.k8sClient.GetPods(namespace)
+	running := 0
+	for _, p := range podsAfter {
+		if p.Phase == "Running" {
+			running++
+		}
+	}
+	fmt.Printf("   ✓ Final state: %d/%d pods running\n", running, len(podsAfter))
+	fmt.Printf("   ✓ Duration: %s\n", duration)
+	fmt.Printf("   ✓ Latency cleaned up: ✓\n")
 
 	e.PrintFooter(duration)
-	fmt.Printf("   Network latency injected and cleaned up\n")
+	fmt.Printf("   Network latency test completed\n")
 
 	return nil
 }

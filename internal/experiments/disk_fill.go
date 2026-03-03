@@ -37,39 +37,93 @@ func (e *DiskFillExperiment) Run(namespace, duration string) error {
 		return err
 	}
 
-	fmt.Printf("\n⚙️  Progress:\n")
-	fmt.Printf("   ✓ Identified pods in namespace\n")
-	fmt.Printf("   ✓ Selected target: %s\n", targetPod.Name)
+	fmt.Printf("\n🔍 DIAGNOSIS - Initial State:\n")
+
+	statsBefore, err := e.k8sClient.GetPodStats(namespace, targetPod.Name)
+	if err == nil {
+		fmt.Printf("   ✓ Target pod: %s\n", targetPod.Name)
+		fmt.Printf("      Status: %s\n", statsBefore.Phase)
+		fmt.Printf("      Restarts: %d\n", statsBefore.Restarts)
+		fmt.Printf("      Age: %s\n", statsBefore.Age)
+	}
+
+	cmd := exec.Command("kubectl", "exec", "-n", namespace, targetPod.Name, "--", "sh", "-c",
+		"df -h / | tail -1")
+	diskBefore, _ := cmd.CombinedOutput()
+	fmt.Printf("   📊 Disk before: %s\n", string(diskBefore))
+
+	podsBefore, _ := e.k8sClient.GetPods(namespace)
+	fmt.Printf("   ✓ Namespace overview: %d pods running\n", len(podsBefore))
+
+	fmt.Printf("\n⚙️  EXECUTION - Filling Disk:\n")
 
 	startTime := time.Now()
 	iteration := 1
+	var lastReport time.Duration
 
 	for time.Since(startTime) < dur {
-		fmt.Printf("   ✓ Iteration %d: Filling disk with data...\n", iteration)
+		elapsed := time.Since(startTime)
 
-		cmd := exec.Command("kubectl", "exec", "-n", namespace, targetPod.Name, "--", "sh", "-c",
-			"dd if=/dev/zero of=/tmp/diskfill bs=1M count=100 2>/dev/null || echo 'Disk fill limited'")
+		if elapsed-lastReport >= 30*time.Second || elapsed >= dur {
+			cmd := exec.Command("kubectl", "exec", "-n", namespace, targetPod.Name, "--", "sh", "-c",
+				"df -h / | tail -1 | awk '{print $5}'")
+			diskUsage, _ := cmd.CombinedOutput()
+			fmt.Printf("   📊 [%s elapsed] Iteration %d - Disk usage: %s", elapsed.Round(time.Second), iteration, string(diskUsage))
+			lastReport = elapsed
+		}
+
+		fmt.Printf("   ✓ Iteration %d: Filling disk (100M)...\n", iteration)
+
+		cmd = exec.Command("kubectl", "exec", "-n", namespace, targetPod.Name, "--", "sh", "-c",
+			"dd if=/dev/zero of=/tmp/diskfill bs=1M count=100 2>/dev/null || echo 'limited'")
 		_ = cmd.Run()
 
-		fmt.Printf("   ✓ Iteration %d: Disk filled (100M)\n", iteration)
+		cmd = exec.Command("kubectl", "exec", "-n", namespace, targetPod.Name, "--", "sh", "-c",
+			"ls -lh /tmp/diskfill 2>/dev/null || echo 'file not found'")
+		verify, _ := cmd.CombinedOutput()
+		if len(verify) > 0 && string(verify) != "file not found\n" {
+			fmt.Printf("      ✓ File created: %s\n", string(verify))
+		}
 
-		time.Sleep(5 * time.Second)
+		time.Sleep(2 * time.Second)
 
-		cleanupCmd := exec.Command("kubectl", "exec", "-n", namespace, targetPod.Name, "--", "sh", "-c",
+		cmd = exec.Command("kubectl", "exec", "-n", namespace, targetPod.Name, "--", "sh", "-c",
 			"rm -f /tmp/diskfill 2>/dev/null || true")
-		_ = cleanupCmd.Run()
+		_ = cmd.Run()
 
 		iteration++
-		time.Sleep(5 * time.Second)
+		time.Sleep(2 * time.Second)
 	}
 
-	fmt.Printf("   ✓ Disk fill cycle completed\n")
+	fmt.Printf("   ✅ Disk fill cycles completed\n")
 
-	fmt.Printf("\n📊 Metrics:\n")
-	fmt.Printf("   Disk filled: 100M per iteration\n")
-	fmt.Printf("   Target: %s\n", targetPod.Name)
-	fmt.Printf("   Duration: %s\n", duration)
-	fmt.Printf("   Iterations: %d\n", iteration-1)
+	fmt.Printf("\n📈 RESULTS - After Disk Fill Test:\n")
+
+	cmd = exec.Command("kubectl", "exec", "-n", namespace, targetPod.Name, "--", "sh", "-c",
+		"df -h / | tail -1")
+	diskAfter, _ := cmd.CombinedOutput()
+	fmt.Printf("   📊 Disk after: %s\n", string(diskAfter))
+
+	statsAfter, err := e.k8sClient.GetPodStats(namespace, targetPod.Name)
+	if err == nil {
+		fmt.Printf("   ✓ Target pod: %s\n", targetPod.Name)
+		fmt.Printf("      Status: %s\n", statsAfter.Phase)
+		fmt.Printf("      Restarts: %d (before: %d)\n", statsAfter.Restarts, statsBefore.Restarts)
+		if statsAfter.Restarts > statsBefore.Restarts {
+			fmt.Printf("      ⚠ Pod was restarted due to disk pressure!\n")
+		}
+	}
+
+	podsAfter, _ := e.k8sClient.GetPods(namespace)
+	running := 0
+	for _, p := range podsAfter {
+		if p.Phase == "Running" {
+			running++
+		}
+	}
+	fmt.Printf("   ✓ Final state: %d/%d pods running\n", running, len(podsAfter))
+	fmt.Printf("   ✓ Total iterations: %d\n", iteration-1)
+	fmt.Printf("   ✓ Duration: %s\n", duration)
 
 	e.PrintFooter(duration)
 	fmt.Printf("   Disk fill test completed\n")
