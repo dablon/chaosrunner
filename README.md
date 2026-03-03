@@ -1,6 +1,6 @@
-# ChaosRunner 🔥
+# ChaosRunner
 
-<div align="center">
+Kubernetes chaos engineering tool for injecting faults into containerized applications.
 
 [![Go](https://img.shields.io/badge/Go-1.25+-00ADD8?style=flat&logo=go)](https://golang.org)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
@@ -35,7 +35,7 @@ go build -o chaosrunner ./cmd
 sudo mv chaosrunner /usr/local/bin/
 ```
 
-### Run Your First Experiment
+## Usage
 
 ```bash
 # List available experiments
