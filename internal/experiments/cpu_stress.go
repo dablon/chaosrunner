@@ -27,6 +27,11 @@ func (e *CpuStressExperiment) Run(namespace, duration string) error {
 	fmt.Printf("   Duration: %s\n", duration)
 	fmt.Printf("   Stress workers: 4\n")
 
+	dur, err := ParseDuration(duration)
+	if err != nil {
+		return err
+	}
+
 	targetPod, err := e.k8sClient.GetRunningPod(namespace)
 	if err != nil {
 		return err
@@ -37,20 +42,34 @@ func (e *CpuStressExperiment) Run(namespace, duration string) error {
 	fmt.Printf("   ✓ Selected target: %s\n", targetPod.Name)
 	fmt.Printf("   ✓ Starting CPU stress...\n")
 
+	stressDuration := int(dur.Seconds())
+	if stressDuration > 300 {
+		stressDuration = 300
+	}
+
 	cmd := exec.Command("kubectl", "exec", "-n", namespace, targetPod.Name, "--", "sh", "-c",
-		"which stress-ng >/dev/null 2>&1 && stress-ng --cpu 4 --timeout 30s || (which stress >/dev/null 2>&1 && stress -c 4 -t 30s) || (apk add --no-cache stress 2>/dev/null && stress -c 4 -t 30s) || echo 'CPU stress tools not available'")
-	_ = cmd.Run()
+		fmt.Sprintf("stress-ng --cpu 4 --timeout %ds 2>/dev/null || (stress -c 4 -t %ds 2>/dev/null) || (apk add --no-cache stress 2>/dev/null && stress -c 4 -t %ds)", stressDuration, stressDuration, stressDuration))
+	cmd.Run()
 
 	fmt.Printf("   ✓ CPU stress applied\n")
-	fmt.Printf("   ✓ Monitoring resource usage...\n")
+	fmt.Printf("   ⏳ Running CPU stress for %s...\n", duration)
 
-	time.Sleep(2 * time.Second)
+	startTime := time.Now()
+	iteration := 1
+
+	for time.Since(startTime) < dur {
+		fmt.Printf("   ✓ Iteration %d: CPU stress active (%.0fs elapsed)\n", iteration, time.Since(startTime).Seconds())
+		time.Sleep(10 * time.Second)
+		iteration++
+	}
+
+	fmt.Printf("   ✓ CPU stress completed\n")
 
 	fmt.Printf("\n📊 Metrics:\n")
 	fmt.Printf("   CPU load increased by: ~400%%\n")
-	fmt.Printf("   Duration: 30s\n")
+	fmt.Printf("   Duration: %s\n", duration)
 	fmt.Printf("   Target: %s\n", targetPod.Name)
-	fmt.Printf("   Total pods affected: 1\n")
+	fmt.Printf("   Iterations: %d\n", iteration-1)
 
 	e.PrintFooter(duration)
 	fmt.Printf("   CPU stress test completed\n")

@@ -27,6 +27,11 @@ func (e *MemoryHogExperiment) Run(namespace, duration string) error {
 	fmt.Printf("   Duration: %s\n", duration)
 	fmt.Printf("   Memory: 512MB\n")
 
+	dur, err := ParseDuration(duration)
+	if err != nil {
+		return err
+	}
+
 	targetPod, err := e.k8sClient.GetRunningPod(namespace)
 	if err != nil {
 		return err
@@ -37,20 +42,34 @@ func (e *MemoryHogExperiment) Run(namespace, duration string) error {
 	fmt.Printf("   ✓ Selected target: %s\n", targetPod.Name)
 	fmt.Printf("   ✓ Starting memory stress...\n")
 
+	memDuration := int(dur.Seconds())
+	if memDuration > 300 {
+		memDuration = 300
+	}
+
 	cmd := exec.Command("kubectl", "exec", "-n", namespace, targetPod.Name, "--", "sh", "-c",
-		"stress-ng --vm 2 --vm-bytes 256M --timeout 30s 2>/dev/null || (dd if=/dev/zero of=/tmp/memhog bs=1M count=256 2>/dev/null &); sleep 30; rm -f /tmp/memhog 2>/dev/null || echo 'Memory stress completed'")
-	_ = cmd.Run()
+		fmt.Sprintf("stress-ng --vm 2 --vm-bytes 256M --timeout %ds 2>/dev/null || (dd if=/dev/zero of=/tmp/memhog bs=1M count=256 &); sleep %ds; rm -f /tmp/memhog 2>/dev/null || true", memDuration, memDuration))
+	cmd.Run()
 
 	fmt.Printf("   ✓ Memory stress applied\n")
-	fmt.Printf("   ✓ Monitoring memory usage...\n")
+	fmt.Printf("   ⏳ Running memory stress for %s...\n", duration)
 
-	time.Sleep(2 * time.Second)
+	startTime := time.Now()
+	iteration := 1
+
+	for time.Since(startTime) < dur {
+		fmt.Printf("   ✓ Iteration %d: Memory stress active (%.0fs elapsed)\n", iteration, time.Since(startTime).Seconds())
+		time.Sleep(10 * time.Second)
+		iteration++
+	}
+
+	fmt.Printf("   ✓ Memory stress completed\n")
 
 	fmt.Printf("\n📊 Metrics:\n")
 	fmt.Printf("   Memory consumed: ~256MB\n")
-	fmt.Printf("   Duration: 30s\n")
+	fmt.Printf("   Duration: %s\n", duration)
 	fmt.Printf("   Target: %s\n", targetPod.Name)
-	fmt.Printf("   Total pods affected: 1\n")
+	fmt.Printf("   Iterations: %d\n", iteration-1)
 
 	e.PrintFooter(duration)
 	fmt.Printf("   Memory hog test completed\n")

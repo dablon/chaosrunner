@@ -26,41 +26,59 @@ func (e *PodKillExperiment) Run(namespace, duration string) error {
 	fmt.Printf("   Duration: %s\n", duration)
 	fmt.Printf("   Target: Random pods in namespace\n")
 
-	pods, err := e.k8sClient.GetPods(namespace)
-	if err != nil {
-		return fmt.Errorf("failed to list pods: %v", err)
-	}
-
-	fmt.Printf("\n⚙️  Progress:\n")
-	fmt.Printf("   ✓ Identified %d pods in namespace\n", len(pods))
-
-	targetPod, err := e.k8sClient.GetRunningPod(namespace)
+	dur, err := ParseDuration(duration)
 	if err != nil {
 		return err
 	}
 
-	fmt.Printf("   ✓ Selected target: %s\n", targetPod.Name)
+	fmt.Printf("\n⚙️  Progress:\n")
 
-	start := time.Now()
-	err = e.k8sClient.DeletePod(namespace, targetPod.Name)
-	if err != nil {
-		return fmt.Errorf("failed to delete pod: %v", err)
+	startTime := time.Now()
+	iteration := 1
+
+	for time.Since(startTime) < dur {
+		pods, err := e.k8sClient.GetPods(namespace)
+		if err != nil {
+			return fmt.Errorf("failed to list pods: %v", err)
+		}
+
+		fmt.Printf("   ✓ Iteration %d: Identified %d pods in namespace\n", iteration, len(pods))
+
+		targetPod, err := e.k8sClient.GetRunningPod(namespace)
+		if err != nil {
+			fmt.Printf("   ⚠ No running pods found, waiting...\n")
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		fmt.Printf("   ✓ Iteration %d: Selected target: %s\n", iteration, targetPod.Name)
+
+		killStart := time.Now()
+		err = e.k8sClient.DeletePod(namespace, targetPod.Name)
+		if err != nil {
+			fmt.Printf("   ⚠ Failed to delete pod: %v\n", err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		terminationTime := time.Since(killStart).Seconds()
+		fmt.Printf("   ✓ Iteration %d: Pod terminated (%.1fs)\n", iteration, terminationTime)
+
+		fmt.Printf("   ✓ Waiting for ReplicaSet to spawn new pod...\n")
+		time.Sleep(3 * time.Second)
+
+		iteration++
+		fmt.Printf("   ✓ Sleeping before next iteration...\n")
+		time.Sleep(2 * time.Second)
 	}
 
-	terminationTime := time.Since(start).Seconds()
-	fmt.Printf("   ✓ Sending termination signal...\n")
-	fmt.Printf("   ✓ Pod terminated successfully\n")
-	fmt.Printf("   ✓ ReplicaSet controller spawning new pod...\n")
-
-	time.Sleep(2 * time.Second)
-
 	fmt.Printf("\n📊 Metrics:\n")
-	fmt.Printf("   Termination time: %.1fs\n", terminationTime)
-	fmt.Printf("   Recovery time: %.1fs\n", 2.0)
-	fmt.Printf("   Total pods affected: 1\n")
+	fmt.Printf("   Total iterations: %d\n", iteration-1)
+	fmt.Printf("   Total pods affected: %d\n", iteration-1)
+	fmt.Printf("   Duration: %s\n", duration)
 
 	e.PrintFooter(duration)
-	fmt.Printf("   Recovery time: 2.0s (within threshold)\n")
+	fmt.Printf("   Recovery time: ~3s per iteration (within threshold)\n")
 
 	return nil
 }

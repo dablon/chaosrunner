@@ -27,6 +27,11 @@ func (e *DiskFillExperiment) Run(namespace, duration string) error {
 	fmt.Printf("   Duration: %s\n", duration)
 	fmt.Printf("   Fill size: 100M\n")
 
+	dur, err := ParseDuration(duration)
+	if err != nil {
+		return err
+	}
+
 	targetPod, err := e.k8sClient.GetRunningPod(namespace)
 	if err != nil {
 		return err
@@ -35,21 +40,36 @@ func (e *DiskFillExperiment) Run(namespace, duration string) error {
 	fmt.Printf("\n⚙️  Progress:\n")
 	fmt.Printf("   ✓ Identified pods in namespace\n")
 	fmt.Printf("   ✓ Selected target: %s\n", targetPod.Name)
-	fmt.Printf("   ✓ Filling disk with data...\n")
 
-	cmd := exec.Command("kubectl", "exec", "-n", namespace, targetPod.Name, "--", "sh", "-c",
-		"dd if=/dev/zero of=/tmp/diskfill bs=1M count=100 2>/dev/null || echo 'Disk fill limited by container permissions'")
-	_ = cmd.Run()
+	startTime := time.Now()
+	iteration := 1
 
-	fmt.Printf("   ✓ Disk fill applied\n")
-	fmt.Printf("   ✓ Monitoring disk usage...\n")
+	for time.Since(startTime) < dur {
+		fmt.Printf("   ✓ Iteration %d: Filling disk with data...\n", iteration)
 
-	time.Sleep(1 * time.Second)
+		cmd := exec.Command("kubectl", "exec", "-n", namespace, targetPod.Name, "--", "sh", "-c",
+			"dd if=/dev/zero of=/tmp/diskfill bs=1M count=100 2>/dev/null || echo 'Disk fill limited'")
+		_ = cmd.Run()
+
+		fmt.Printf("   ✓ Iteration %d: Disk filled (100M)\n", iteration)
+
+		time.Sleep(5 * time.Second)
+
+		cleanupCmd := exec.Command("kubectl", "exec", "-n", namespace, targetPod.Name, "--", "sh", "-c",
+			"rm -f /tmp/diskfill 2>/dev/null || true")
+		_ = cleanupCmd.Run()
+
+		iteration++
+		time.Sleep(5 * time.Second)
+	}
+
+	fmt.Printf("   ✓ Disk fill cycle completed\n")
 
 	fmt.Printf("\n📊 Metrics:\n")
-	fmt.Printf("   Disk filled: 100M\n")
+	fmt.Printf("   Disk filled: 100M per iteration\n")
 	fmt.Printf("   Target: %s\n", targetPod.Name)
-	fmt.Printf("   Total pods affected: 1\n")
+	fmt.Printf("   Duration: %s\n", duration)
+	fmt.Printf("   Iterations: %d\n", iteration-1)
 
 	e.PrintFooter(duration)
 	fmt.Printf("   Disk fill test completed\n")
